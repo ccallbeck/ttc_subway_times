@@ -1,0 +1,265 @@
+---
+title: "TTC Data Exploration"
+author: "Curtis Callbeck"
+date: "November 15, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+
+file_location <- "C:/Users/Curtis/Downloads/data/data/" # set this to where you unzipped them.
+```
+
+## Import the data
+I haven't yet gotten a Postgres database working on my computer, so I've just downloaded one of the .csv dumps off SpiderOak. Figure I can write the filtering code first.
+
+
+```{r import data}
+list.files(file_location)
+
+polls     <- read_csv(paste0(file_location, "polls.csv"))
+requests  <- read_csv(paste0(file_location, "requests.csv"))
+ntas_data <- read_csv(paste0(file_location, "ntas_data.csv"))
+
+```
+
+## Lets have a look inside the tables
+###Polls
+```{r poll glimpse}
+glimpse(polls)
+
+range(polls$poll_start)
+
+hist(as.numeric(polls$poll_end - polls$poll_start), main = "Histogram of polling times", xlab = "Poll Duration (Seconds)")
+```
+
+Looks like this dump was from the end of March 23 to sometime April 19th. Most polls took less than 5 seconds to execute, hardly any more than 10 seconds.
+
+###Requests
+```{r request glimpse}
+glimpse(requests)
+
+sum(requests$all_stations != "success")
+```
+
+All the requests for this dump were successful.
+
+###Ntas Data
+```{r ntas_data glimpse}
+glimpse(ntas_data)
+```
+
+So the data is 
+
+## Tidying the Data
+```{r tidying}
+data_raw <- ntas_data %>%
+  left_join(requests, by = c("requestid" = "requestid")) %>%
+  left_join(polls, by = c("pollid" = "pollid")) %>%  #Join to get timestamps
+  filter((subwayline == "YUS"  & lineid == 1) | # Some entries have stations on the incorrect line
+         (subwayline == "BD"   & lineid == 2) |
+         (subwayline == "SHEP" & lineid == 4) ) %>%
+  select(-data_, -system_message_type, -all_stations, -requestid, -pollid, -lineid) #superfluous columns
+
+head(data_raw)
+
+stations <- data_raw %>%
+  group_by(station_char, stationid, traindirection) %>%
+  summarize()
+
+head(stations)
+```
+
+### Selecting just one day to look at first
+
+```{r filter day}
+one_day <- data_raw %>%
+  mutate(workday = cut(request_date - hours(5), breaks = "days")) %>% #TTC days extend past midnight into the next
+  filter(workday == "2017-04-11") %>%
+  arrange(poll_start)
+```
+
+### Selecting just one train that day to look at
+
+```{r filter train}
+one_train_day <- one_day %>%
+  filter(trainid == "102")
+
+print(one_train_day, n = 20)
+```
+
+### Still too many entries
+
+Filtering the results for only the closest station per time period, as long as ia minute away.
+
+I'm not entirely sure how to best filter these.
+*I like selecting only the minimum timint for a period, as there's only one closest station to a train, however that leaves out data for trains between stations too often.
+*To combat that I reluctantly added back in entries with timint < ~1 minute
+* A better strategy might be to allow two entries for timestamps, if the first is in the station? Need to think about that some more
+
+```{r filter timint}
+one_train_day_nearest <- one_train_day %>%
+  group_by(poll_start) %>%
+  filter(timint == min(timint) & 
+         timint <= 1.10) %>% 
+  ungroup()
+```
+
+### Transform Data grouped by station observations into train trips
+The purpose of the following chunk is to change the data structure from a station to a train orientation. Start to calculate differences in time between stations.
+
+First we're going to calculate an estimated arrival time at the station, if there's no exact query when it's in station. We'll arrange the entries by this new time. 
+This is where the issues are showing up mentioned in the chunk above. If there's a new delay, some of these entries will start to get intertwined.
+
+Also added in this step is the 
+*previous station where the train came from, 
+*a rudimentary index of the number of station to station trips the train has made,
+*indicator whether the station number is increasing or decreasing (to help capture short turns in the future)
+*indicator if the train went out of service and back in later in the day. Train 102 went out of service ~10AM after morning rush, and back into service at ~4:20 for the evening.
+
+
+```{r}
+station_transits <- one_train_day_nearest %>%
+  mutate(arrive_time        = request_date + seconds(round(timint * 60))) %>%
+  arrange(arrive_time) %>%
+  mutate(stationid_last     = dplyr::lag(stationid, default = stationid[1]),
+         station_change     = stationid != stationid_last,
+         station_change_num = cumsum(station_change),
+         station_dir        = stationid - stationid_last,
+         service_break      = arrive_time - lag(arrive_time, order_by = arrive_time, default = arrive_time[1]) > seconds(3600),
+         daily_trip         = cumsum(service_break))
+
+station_transits
+```
+## Tidying up things a bit more
+
+With this chunk I want to 
+*group up each of the station changes together and get the timestamp.
+*grab the previous station
+*Determine the trip(? don't know the domain terms, cumulative index increases every direction change)
+*Calculate the duration between stations
+*filter out the stuff that's not needed
+
+```{r }
+
+clean_transits <- station_transits %>%
+  group_by(subwayline, trainid, daily_trip, station_change_num) %>%
+  summarize(stationid      = stationid[1],
+            arrive_time    = min(arrive_time),
+            direction      = sum(station_dir) > 0) %>%
+  ungroup() %>%
+  group_by(daily_trip) %>%
+  mutate(depart_time      = dplyr::lag(arrive_time),
+         trip             = cumsum(direction != lag(direction, default = TRUE)),
+         origin_stationid = dplyr::lag(stationid),
+         duration         = arrive_time - depart_time) %>%
+  ungroup() %>%
+  filter(!is.na(depart_time)) %>%
+  select(subwayline, trainid, daily_trip, trip, origin_stationid, stationid, depart_time, arrive_time, duration)
+
+print(clean_transits, n = 30)
+
+filter(clean_transits, abs(origin_stationid - stationid) > 1) #one trip that missed station 14 (Osgoode)
+
+arrange(clean_transits, desc(duration)) %>%
+  head()
+
+```
+Looks reasonable so far off one train.
+
+##All Trains
+Now we've got the data set up in a standard format, time to loop through all the trains.
+
+Pretty much going to combine all the stuff from above into one big function. Run it through a loop and bind all the rows together.
+```{r }
+
+one_day_trains <- unique(one_day$trainid)
+
+train_tripifier <- function(train) {
+  one_day %>%
+  filter(trainid == train) %>%    group_by(poll_start) %>%
+  filter(timint == min(timint) & timint <= 1.15) %>%
+  ungroup() %>%
+  mutate(arrive_time        = request_date + seconds(round(timint * 60))) %>%
+  arrange(arrive_time) %>%
+  mutate(stationid_last     = dplyr::lag(stationid, default = stationid[1]),
+         station_change     = stationid != stationid_last,
+         station_change_num = cumsum(station_change),
+         station_dir        = stationid - stationid_last,
+         service_break      = arrive_time - lag(arrive_time, order_by = arrive_time, default = arrive_time[1]) > seconds(3600),
+         daily_trip         = cumsum(service_break)) %>%
+  group_by(subwayline, trainid, daily_trip, station_change_num) %>%
+  summarize(stationid      = stationid[1],
+            arrive_time    = min(arrive_time),
+            direction      = sum(station_dir) > 0) %>%
+  ungroup() %>%
+  group_by(daily_trip) %>%
+  mutate(depart_time      = dplyr::lag(arrive_time),
+         trip             = cumsum(direction != lag(direction, default = TRUE)),       
+         origin_stationid = dplyr::lag(stationid),
+         duration         = arrive_time - depart_time) %>%
+  ungroup() %>%
+  filter(!is.na(depart_time)) %>%
+  select(subwayline, trainid, daily_trip, trip, origin_stationid, stationid, depart_time, arrive_time, duration) %>%
+  return()
+}
+
+one_day_trip <- map(one_day_trains, train_tripifier) %>%
+  bind_rows()
+
+```
+
+### What's inside?
+First thing I'm looking for are the entries where a station got missed. I wonder how many of these are instances where a train bypassed the station, and how many are instances where the minute resolution of the scanner missed a stop. Are there any patterns between stations. Are there any patterns with trains? Patterns with time?
+
+Ultimately this section here will influence how I filter out / wrangle the data above.
+```{r}
+one_day_trip %>%
+  filter(abs(origin_stationid - stationid) > 1) %>%
+  nrow()
+
+one_day_trip %>%
+  filter(abs(origin_stationid - stationid) > 1) %>%
+  group_by(origin_stationid, stationid) %>%
+  count() %>%
+  arrange(desc(n))
+
+filter(one_day_trip, abs(origin_stationid - stationid) > 1) %>%
+  group_by(trainid) %>%
+  count() %>%
+  arrange(desc(n)) %>%
+  print(n = 10) %$%
+  hist(.$n, main = "Not sure what to make of this distribution", xlab = "Missing stations per train", breaks = 15)
+
+filter(one_day_trip, abs(origin_stationid - stationid) > 1) %>%
+  group_by(cut(depart_time, breaks = "hours")) %>%
+  count() %>%
+  print() %>%
+  plot()
+```
+
+*402 of these gaps. ~1% of the trips. Not super high, but reliability is at the margins? Going to try getting this down.
+
+*Osgoode definitely is where it's happening the most, almost 40%
+
+*Majority of trains only missed one. Going to look more into 128 and 464.
+
+*Time of day doesn't seem to have an obvious pattern, but this is only one day. Higher around noon-1ish and midnight-1ish.
+
+
+#Summary stats for trips
+Not really paying attention to this so much until I do a better job of the data wrangling.
+```{r}
+
+one_day_trip %>%
+  group_by(subwayline, origin_stationid, stationid) %>%
+  summarise(median = median(duration),
+            sd = sd(duration),
+            n = n())
+
+```
+
